@@ -24,6 +24,13 @@
 
 
 struct _sthread {
+  int prioridade_base;      // fixa na criação
+  int prioridade_atual;    // muda se for prioridade dinâmica
+  int quantum_base;       // normalmente = 5
+  int quantum_restante;  // decrementado a cada tick
+  int nice;             // de 0 a 10
+  int prioridade_fixa; // 1 se prioridade 0–4
+
   sthread_ctx_t *saved_ctx;
   sthread_start_func_t start_routine_ptr;
   long wake_time;
@@ -42,15 +49,46 @@ static queue_t *zombie_thr_list;
 static struct _sthread *active_thr;   /* thread activa */
 static int tid_gen;                   /* gerador de tid's */
 
-
+#define NUM_PRIORIDADES 15
 #define CLOCK_TICK 100
 static long Clock;
 
+typedef struct {
+  queue_t* filas[NUM_PRIORIDADES];
+} runqueue_t;
 
+static runqueue_t runqueue_ativa;
+static runqueue_t runqueue_expirada;
 /*********************************************************************/
 /* Part 1: Creating and Scheduling Threads                           */
 /*********************************************************************/
+void trocar_epoca() {
+  runqueue_t temp = runqueue_ativa;
+  runqueue_ativa = runqueue_expirada;
+  runqueue_expirada = temp;
+}
 
+struct _sthread* escolher_proxima_tarefa() {
+  for (int i = 0; i < NUM_PRIORIDADES; i++) {
+    if (!queue_is_empty(runqueue_ativa.filas[i])) {
+      return queue_remove(runqueue_ativa.filas[i]);
+    }
+  }
+  return NULL;
+}
+
+void update_task_priority(struct _sthread* t) {
+  if (!t->prioridade_fixa) {
+    int novo_quantum = t->quantum_base + (t->quantum_restante / 2);
+    int nova_prioridade = t->prioridade_base - t->quantum_restante + t->nice;
+
+    if (nova_prioridade < 5) nova_prioridade = 5;
+    if (nova_prioridade > 14) nova_prioridade = 14;
+
+    t->quantum_restante = novo_quantum;
+    t->prioridade_atual = nova_prioridade;
+  }
+}
 
 void sthread_user_free(struct _sthread *thread);
 
@@ -63,13 +101,15 @@ void sthread_aux_start(void){
 void sthread_user_dispatcher(void);
 
 void sthread_user_init(void) {
-
-  exe_thr_list = create_queue();
-  dead_thr_list = create_queue();
   sleep_thr_list = create_queue();
   join_thr_list = create_queue();
   zombie_thr_list = create_queue();
   tid_gen = 1;
+
+  for (int i = 0; i < NUM_PRIORIDADES; i++) {
+      runqueue_ativa.filas[i] = create_queue();
+      runqueue_expirada.filas[i] = create_queue();
+  }
 
   struct _sthread *main_thread = malloc(sizeof(struct _sthread));
   main_thread->start_routine_ptr = NULL;
@@ -87,7 +127,7 @@ void sthread_user_init(void) {
 }
 
 
-sthread_t sthread_user_create(sthread_start_func_t start_routine, void *arg)
+sthread_t sthread_user_create(sthread_start_func_t start_routine, void *arg,int priority)
 {
   struct _sthread *new_thread = (struct _sthread*)malloc(sizeof(struct _sthread));
   sthread_ctx_start_func_t func = sthread_aux_start;
@@ -97,15 +137,117 @@ sthread_t sthread_user_create(sthread_start_func_t start_routine, void *arg)
   new_thread->join_tid = 0;
   new_thread->join_ret = NULL;
   new_thread->saved_ctx = sthread_new_ctx(func);
+
+  new_thread->prioridade_base = priority;
+  new_thread->prioridade_atual = priority;
+  new_thread->quantum_base = 5;
+  new_thread->quantum_restante = 5;
+  new_thread->nice = 0;
+  new_thread->prioridade_fixa = (priority < 5);
   
   splx(HIGH);
   new_thread->tid = tid_gen++;
-  queue_insert(exe_thr_list, new_thread);
+  queue_insert(runqueue_ativa.filas[priority], new_thread);
   splx(LOW);
   return new_thread;
 }
 
+int sthread_nice(int nice){
+   active_thr->nice=nice;
+   if(!active_thr->prioridade_fixa){
+      int nova_prioridade=active_thr->prioridade_base - active_thr->quantum_restante+nice;
+      if(nova_prioridade<5) nova_prioridade=5;
+      if(nova_prioridade>14) nova_prioridade=14;
 
+      return nova_prioridade;
+   }
+   return active_thr->prioridade_atual;
+}
+
+void sthread_dump() {
+  printf("=== dump start ===\n");
+  printf("active thread\nid: %d\npriority: %d\nquantum: %d\n",
+         active_thr->tid, active_thr->prioridade_atual, active_thr->quantum_restante);
+
+  printf("active runqueue\n");
+  for (int i = 0; i < NUM_PRIORIDADES; i++) {
+    printf("[%d] ", i);
+    queue_element_t* el = runqueue_ativa.filas[i]->first;
+    while (el != NULL) {
+      printf("%d,%d ", el->thread->tid, el->thread->quantum_restante);
+      el = el->next;
+    }
+    printf("\n");
+  }
+
+  printf("expired runqueue\n");
+  for (int i = 0; i < NUM_PRIORIDADES; i++) {
+    printf("[%d] ", i);
+    queue_element_t* el = runqueue_expirada.filas[i]->first;
+    while (el != NULL) {
+      printf("%d,%d ", el->thread->tid, el->thread->quantum_restante);
+      el = el->next;
+    }
+    printf("\n");
+  }
+  /*
+  printf("blocked list\n");
+  queue_element_t* el = sleep_thr_list->first;
+  while (el != NULL) {
+    printf("%d,%d ", el->thread->tid, el->thread->quantum_restante);
+    el = el->next;
+  }
+  */
+  printf("\n=== dump end ===\n");
+}
+
+void sthread_user_exit(void *ret) {
+    splx(HIGH);
+    
+    int is_zombie = 1;
+
+    // 1. Tratar threads em espera no join
+    queue_t *tmp_queue = create_queue();   
+    while (!queue_is_empty(join_thr_list)) {
+        struct _sthread *thread = queue_remove(join_thr_list);
+        
+        if (thread->join_tid == active_thr->tid) {
+            thread->join_ret = ret;
+            // Reinsere na runqueue ativa com sua prioridade atual
+            queue_insert(runqueue_ativa.filas[thread->prioridade_atual], thread);
+            is_zombie = 0;
+        } else {
+            queue_insert(tmp_queue, thread);
+        }
+    }
+    delete_queue(join_thr_list);
+    join_thr_list = tmp_queue;
+
+    // 2. Tratar thread terminada
+    if (is_zombie) {
+        queue_insert(zombie_thr_list, active_thr);
+    } else {
+        // Se não é zombie, podemos liberar imediatamente
+        sthread_user_free(active_thr);
+    }
+
+    // 3. Escolher próxima tarefa
+    struct _sthread *old_thr = active_thr;
+    active_thr = escolher_proxima_tarefa();
+
+    // 4. Se não há mais tarefas, terminar
+    if (active_thr == NULL) {
+        printf("No more threads to execute!\n");
+        exit(0);
+    }
+
+    // 5. Trocar de contexto
+    sthread_switch(old_thr->saved_ctx, active_thr->saved_ctx);
+    
+    splx(LOW);
+}
+
+/*
 void sthread_user_exit(void *ret) {
   splx(HIGH);
    
@@ -119,7 +261,7 @@ void sthread_user_exit(void *ret) {
       printf("Test join list: join_tid=%d, active->tid=%d\n", thread->join_tid, active_thr->tid);
       if (thread->join_tid == active_thr->tid) {
          thread->join_ret = ret;
-         queue_insert(exe_thr_list,thread);
+         queue_insert(runqueue_ativa.filas[active_thr->prioridade_atual],thread);
          is_zombie = 0;
       } else {
          queue_insert(tmp_queue,thread);
@@ -135,8 +277,8 @@ void sthread_user_exit(void *ret) {
    }
    
 
-   if(queue_is_empty(exe_thr_list)){  /* pode acontecer se a unica thread em execucao fizer */
-    free(exe_thr_list);              /* sthread_exit(0). Este codigo garante que o programa sai bem. */
+   if(queue_is_empty(exe_thr_list)){  
+    free(exe_thr_list);              /
     delete_queue(dead_thr_list);
     sthread_user_free(active_thr);
     printf("Exec queue is empty!\n");
@@ -152,11 +294,10 @@ void sthread_user_exit(void *ret) {
    splx(LOW);
 }
 
-
 void sthread_user_dispatcher(void)
 {
    Clock++;
-
+  
    queue_t *tmp_queue = create_queue();   
 
    while (!queue_is_empty(sleep_thr_list)) {
@@ -175,7 +316,6 @@ void sthread_user_dispatcher(void)
    sthread_user_yield();
 }
 
-
 void sthread_user_yield(void)
 {
   splx(HIGH);
@@ -186,9 +326,97 @@ void sthread_user_yield(void)
   sthread_switch(old_thr->saved_ctx, active_thr->saved_ctx);
   splx(LOW);
 }
+*/
 
+void sthread_user_dispatcher(void) {
+    Clock++;
+    
+    // 1. Verificar se precisa trocar de época (runqueue ativa vazia)
+    int runqueue_ativa_vazia = 1;
+    for (int i = 0; i < NUM_PRIORIDADES; i++) {
+        if (!queue_is_empty(runqueue_ativa.filas[i])) {
+            runqueue_ativa_vazia = 0;
+            break;
+        }
+    }
+    
+    if (runqueue_ativa_vazia) {
+        trocar_epoca();
+    }
+    
+    // 2. Tratar tarefas que estavam dormindo (sleep_thr_list)
+    queue_t *tmp_queue = create_queue();   
+    while (!queue_is_empty(sleep_thr_list)) {
+        struct _sthread *thread = queue_remove(sleep_thr_list);
+        
+        if (thread->wake_time <= Clock) {
+            thread->wake_time = 0;
+            // Inserir na runqueue ativa com prioridade atual
+            queue_insert(runqueue_ativa.filas[thread->prioridade_atual], thread);
+            
+            // Verificar se precisa preemptar (se a nova tarefa tem maior prioridade)
+            if (thread->prioridade_atual < active_thr->prioridade_atual) {
+                // Reinserir a tarefa atual na runqueue
+                queue_insert(runqueue_ativa.filas[active_thr->prioridade_atual], active_thr);
+                // Tornar a nova tarefa ativa
+                active_thr = thread;
+                sthread_switch(active_thr->saved_ctx, thread->saved_ctx);
+            }
+        } else {
+            queue_insert(tmp_queue, thread);
+        }
+    }
+    delete_queue(sleep_thr_list);
+    sleep_thr_list = tmp_queue;
+    
+    // 3. Chamar yield para permitir troca de tarefas
+    sthread_user_yield();
+}
 
-
+void sthread_user_yield(void) {
+    splx(HIGH);
+    
+    struct _sthread *old_thr = active_thr;
+    
+    // Se a tarefa ainda tem quantum restante
+    if (old_thr->quantum_restante > 0) {
+        old_thr->quantum_restante--;
+        
+        // Se ainda tem quantum, reinserir na runqueue ativa
+        if (old_thr->quantum_restante > 0) {
+            queue_insert(runqueue_ativa.filas[old_thr->prioridade_atual], old_thr);
+        } 
+        // Quantum esgotado
+        else {
+            // Para tarefas dinâmicas, calcular nova prioridade e quantum
+            if (!old_thr->prioridade_fixa) {
+                update_task_priority(old_thr);
+            }
+            // Mover para runqueue expirada
+            queue_insert(runqueue_expirada.filas[old_thr->prioridade_atual], old_thr);
+        }
+    }
+    
+    // Escolher próxima tarefa
+    active_thr = escolher_proxima_tarefa();
+    
+    // Se não há tarefas, verificar se pode trocar de época
+    if (active_thr == NULL) {
+        trocar_epoca();
+        active_thr = escolher_proxima_tarefa();
+        
+        // Se ainda não há tarefas, terminar
+        if (active_thr == NULL) {
+            printf("No more threads to execute!\n");
+            exit(0);
+        }
+    }
+    
+    // Realizar a troca de contexto
+    sthread_switch(old_thr->saved_ctx, active_thr->saved_ctx);
+    
+    splx(LOW);
+}
 
 void sthread_user_free(struct _sthread *thread)
 {

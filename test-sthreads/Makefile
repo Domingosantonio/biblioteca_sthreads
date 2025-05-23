@@ -1,7 +1,8 @@
 PROGRAMS = test-create test-mutex \
 	01mutex01 02mutex02 03mutex03\
 	04mutex04 05monitor01 06monitor02\
-	07monitor03 08monitor04 09monitor05
+	07monitor03 08monitor04 09monitor05\
+	supermercado
 
 
 INCLUDES = -I. -I$(srcdir) -I../include -I ../include
@@ -47,6 +48,9 @@ test-mutex: test-mutex.o
 
 09monitor05: 09monitor05.o
 	$(CC) $(CFLAGS) ../sthread_lib/sthread_start.o -o 09monitor05 09monitor05.o $(LIBSTHREAD)
+	
+supermercado: supermercado.o
+	$(CC) $(CFLAGS) ../sthread_lib/sthread_start.o -o supermercado supermercado.o $(LIBSTHREAD)
 
 
 .c.o:
