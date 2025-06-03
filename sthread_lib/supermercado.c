@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include "/home/domingos/Transferências/sthreads/sthread_lib/sthread_user.h"
 #include "sthread.h"
 
 
@@ -129,22 +128,7 @@ void* cliente(void *arg) {
 // Função principal para teste
 int main() {
     sthread_init();
-    init_caixas();
-    
-    // Cria threads para os funcionários (caixas)
-    for (int i = 0; i < NUM_CAIXAS; i++) {
-        sthread_create(funcionario, &caixas[i]);
-    }
-    
-    // Cria threads para os clientes
-    for (int i = 0; i < 10; i++) {
-        sthread_sleep(50); // Intervalo entre chegada de clientes
-        sthread_create(cliente, NULL);
-    }
-    
-    // Espera um tempo para simulação
-    sthread_sleep(5000);
-    
-    free_caixas();
+    //init_caixas();
+    sthread_dump();
     return 0;
 }
